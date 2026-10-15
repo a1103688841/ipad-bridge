@@ -1,0 +1,8 @@
+winrt-runtime>=3.2
+winrt-Windows.Foundation>=3.2
+winrt-Windows.Foundation.Collections>=3.2
+winrt-Windows.Devices.Bluetooth>=3.2
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile>=3.2
+winrt-Windows.Storage.Streams>=3.2
+pystray>=0.19
+Pillow>=10
