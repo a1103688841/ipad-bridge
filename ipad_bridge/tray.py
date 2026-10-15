@@ -22,7 +22,7 @@ def _tablet(color):
 
 
 class Tray:
-    def __init__(self, on_toggle, on_quit, config_path, log_path):
+    def __init__(self, on_toggle, on_quit, on_reset_bluetooth, config_path, log_path):
         self._state = "waiting"
         self._on_toggle = on_toggle
         self._on_quit = on_quit
@@ -35,6 +35,7 @@ class Tray:
                 enabled=lambda item: self._state != "waiting",
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("重置蓝牙（iPad 连不上时用）", lambda: on_reset_bluetooth()),
             pystray.MenuItem("配对新 iPad（打开蓝牙设置）", lambda: os.startfile("ms-settings:bluetooth")),
             pystray.MenuItem("打开配置文件", lambda: os.startfile(config_path)),
             pystray.MenuItem("打开日志", lambda: os.startfile(log_path)),

@@ -11,16 +11,23 @@ import threading
 import time
 import uuid
 
-from winrt.windows.devices.bluetooth import BluetoothAdapter, BluetoothError
+from winrt.windows.devices.bluetooth import (
+    BluetoothAdapter,
+    BluetoothConnectionStatus,
+    BluetoothError,
+    BluetoothLEDevice,
+)
 from winrt.windows.devices.bluetooth.genericattributeprofile import (
     GattCharacteristicProperties as Props,
     GattLocalCharacteristicParameters,
     GattLocalDescriptorParameters,
     GattProtectionLevel,
     GattServiceProvider,
+    GattServiceProviderAdvertisementStatus,
     GattServiceProviderAdvertisingParameters,
     GattSessionStatus,
 )
+from winrt.windows.devices.radios import Radio, RadioKind, RadioState
 from winrt.windows.storage.streams import DataWriter
 
 from . import hid
@@ -29,6 +36,8 @@ log = logging.getLogger(__name__)
 
 ENCRYPTED = GattProtectionLevel.ENCRYPTION_REQUIRED
 CONNECTION_POLL = 0.5  # seconds between checks of who is subscribed
+READVERTISE_INTERVAL = 5.0  # seconds between attempts to restart dropped advertising
+STALE_LINK_WAIT = 6.0  # after start, how long the last iPad may stay linked without subscribing
 
 
 def uuid16(value):
@@ -75,8 +84,10 @@ class _Stats:
 
 
 class BleHid:
-    def __init__(self, on_connection_change=None):
+    def __init__(self, on_connection_change=None, state_path=None):
         self._on_connection_change = on_connection_change
+        self._state_path = state_path  # remembers the last iPad, to recover it after a restart
+        self._resetting = False
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run, name="ble", daemon=True)
         self._ready = threading.Event()
@@ -92,6 +103,7 @@ class BleHid:
 
         self.motion_interval = 0.010
         self._last_motion = 0.0
+        self._next_readvertise = 0.0
         self._stats = _Stats()
 
         self._hid = self._battery = None
@@ -127,13 +139,75 @@ class BleHid:
             self._ready.set()
             return
         self._ready.set()
+        heal = self._loop.create_task(self._heal_stale_link())
         try:
             await self._send_loop()
         finally:
-            for provider in (self._hid, self._battery):
-                if provider is not None:
-                    provider.stop_advertising()
+            heal.cancel()
+            self._stop_providers()
             log.info("advertising stopped")
+
+    def _stop_providers(self):
+        for provider in (self._hid, self._battery):
+            if provider is not None:
+                try:
+                    provider.stop_advertising()
+                except Exception:
+                    pass
+
+    # ---- recovery ------------------------------------------------------------------------------
+
+    async def _heal_stale_link(self):
+        """After this program restarts, the iPad can stay linked to Windows (the link belongs to
+        the OS, not to us) without subscribing to the new HID service, so it never comes back.
+        Cycling the radio drops that link and the iPad then reconnects properly."""
+        await asyncio.sleep(STALE_LINK_WAIT)
+        if self.connected or self._stopping or not self._state_path:
+            return
+        try:
+            with open(self._state_path, encoding="utf-8") as f:
+                last = f.read().strip()
+        except OSError:
+            return
+        if not last:
+            return
+        try:
+            device = await BluetoothLEDevice.from_id_async(last)
+        except Exception as e:
+            log.info("cannot look up last iPad %s: %s", last, e)
+            return
+        if device is None or device.connection_status != BluetoothConnectionStatus.CONNECTED:
+            return
+        log.warning("iPad %s is linked but not subscribed, resetting Bluetooth", last)
+        await self._reset_radio()
+
+    def reset_bluetooth(self):
+        """Thread-safe: turn the Bluetooth radio off and on, then publish the HID service again."""
+        asyncio.run_coroutine_threadsafe(self._reset_radio(), self._loop)
+
+    async def _reset_radio(self):
+        if self._resetting:
+            return
+        self._resetting = True
+        try:
+            await Radio.request_access_async()
+            radios = await Radio.get_radios_async()
+            radio = next((r for r in radios if r.kind == RadioKind.BLUETOOTH), None)
+            if radio is None:
+                log.warning("no Bluetooth radio to reset")
+                return
+            log.info("Bluetooth radio off")
+            await radio.set_state_async(RadioState.OFF)
+            await asyncio.sleep(2)
+            await radio.set_state_async(RadioState.ON)
+            log.info("Bluetooth radio on")
+            await asyncio.sleep(2)
+            self._stop_providers()
+            await self._build()
+        except Exception:
+            log.exception("Bluetooth reset failed")
+        finally:
+            self._resetting = False
 
     async def _build(self):
         adapter = await BluetoothAdapter.get_default_async()
@@ -290,7 +364,34 @@ class BleHid:
                     if r.status != 0:  # GattCommunicationStatus.SUCCESS
                         log.warning("notify -> %s (protocol error %s)", r.status, r.protocol_error)
 
+    def _check_advertising(self):
+        """Restart advertising if Windows dropped it (e.g. after the adapter stopped responding),
+        otherwise a bonded iPad that went away can never find this PC again."""
+        if self.connected or self._hid is None:
+            return
+        status = self._hid.advertisement_status
+        if status in (GattServiceProviderAdvertisementStatus.STARTED,
+                      GattServiceProviderAdvertisementStatus.STARTED_WITHOUT_ALL_ADVERTISEMENT_DATA):
+            return
+        now = time.perf_counter()
+        if now < self._next_readvertise:
+            return
+        self._next_readvertise = now + READVERTISE_INTERVAL
+        log.warning("advertising is %s, restarting it", status)
+        try:
+            self._hid.stop_advertising()
+        except Exception:
+            pass
+        params = GattServiceProviderAdvertisingParameters()
+        params.is_connectable = True
+        params.is_discoverable = True
+        try:
+            self._hid.start_advertising_with_parameters(params)
+        except Exception as e:
+            log.warning("restart advertising failed: %s", e)
+
     def _check_connection(self):
+        self._check_advertising()
         ids = []
         for client in self._mouse.subscribed_clients:
             session = client.session
@@ -301,5 +402,11 @@ class BleHid:
             self.connected = connected
             self.device_ids = ids
             log.info("iPad %s %s", "connected" if connected else "disconnected", ids)
+            if connected and self._state_path:
+                try:
+                    with open(self._state_path, "w", encoding="utf-8") as f:
+                        f.write(ids[0])
+                except OSError as e:
+                    log.warning("cannot save state: %s", e)
             if self._on_connection_change:
                 self._on_connection_change(connected)

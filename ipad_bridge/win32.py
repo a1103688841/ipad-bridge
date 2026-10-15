@@ -125,6 +125,11 @@ def set_pointer_ballistics(threshold1, threshold2, acceleration, speed):
     user32.SystemParametersInfoW(SPI_SETMOUSESPEED, 0, ctypes.c_void_p(speed), 0)
 
 
+winmm = ctypes.WinDLL("winmm")
+winmm.timeBeginPeriod.argtypes = [wintypes.UINT]
+winmm.timeEndPeriod.argtypes = [wintypes.UINT]
+
+
 def set_dpi_aware():
     """Work in physical pixels so hook coordinates, SetCursorPos and monitor rects agree."""
     try:

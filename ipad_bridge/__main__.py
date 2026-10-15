@@ -4,15 +4,27 @@ import logging.handlers
 import os
 import sys
 
-from . import win32
+from . import __version__, win32
 from .ble import BleHid
 from .config import Config
 from .router import MSG_CONNECTION, MSG_TOGGLE, Router, restore_saved_ballistics
 from .tray import Tray
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _data_dir():
+    """The source checkout when run from it, otherwise %LOCALAPPDATA%\\ipad-bridge (pip install)."""
+    checkout = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.exists(os.path.join(checkout, "requirements.txt")):
+        return checkout
+    path = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ipad-bridge")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+ROOT = _data_dir()
 CONFIG_PATH = os.path.join(ROOT, "ipad-bridge.ini")
 LOG_PATH = os.path.join(ROOT, "ipad-bridge.log")
+STATE_PATH = os.path.join(ROOT, "ipad-bridge.state")
 
 
 def setup_logging():
@@ -42,7 +54,8 @@ def main():
     restore_saved_ballistics()
     log.info("Windows pointer settings (threshold1, threshold2, accel, speed): %s", win32.get_pointer_ballistics())
     router = Router(cfg, ble=None)
-    ble = BleHid(on_connection_change=lambda connected: router.post(MSG_CONNECTION, int(connected)))
+    ble = BleHid(on_connection_change=lambda connected: router.post(MSG_CONNECTION, int(connected)),
+                 state_path=STATE_PATH)
     ble.motion_interval = cfg.motion_interval_ms / 1000.0
     router.ble = ble
     try:
@@ -53,7 +66,7 @@ def main():
         return 1
 
     tray = Tray(on_toggle=lambda: router.post(MSG_TOGGLE), on_quit=router.quit,
-                config_path=CONFIG_PATH, log_path=LOG_PATH)
+                on_reset_bluetooth=ble.reset_bluetooth, config_path=CONFIG_PATH, log_path=LOG_PATH)
     router.on_mode_change = lambda ipad_mode: tray.update(ble.connected, ipad_mode)
     tray.start()
 
@@ -61,12 +74,16 @@ def main():
     console_handler = win32.HANDLER_ROUTINE(lambda event: router.quit() or True)
     win32.kernel32.SetConsoleCtrlHandler(console_handler, True)
 
+    # The default 15.6 ms timer tick would stretch the motion pacing waits and make the iPad
+    # pointer stutter; 1 ms ticks (per process on Windows 10 2004+) keep the cadence even.
+    win32.winmm.timeBeginPeriod(1)
     router.install()
-    log.info("running (config %s)", CONFIG_PATH)
+    log.info("iPad Bridge %s running (config %s)", __version__, CONFIG_PATH)
     try:
         router.run()
     finally:
         router.uninstall()
+        win32.winmm.timeEndPeriod(1)
         tray.stop()
         ble.stop()
         log.info("bye")

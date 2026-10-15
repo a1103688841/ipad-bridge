@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 ipad-bridge.ini
 ipad-bridge.log*
+ipad-bridge.state
+build/
+dist/
+*.egg-info/

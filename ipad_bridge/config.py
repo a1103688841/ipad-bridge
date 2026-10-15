@@ -20,8 +20,8 @@ scroll = 1
 # iPad 自己还会再加速一次，两层叠加会让指针发飘
 disable_windows_accel = true
 
-# 鼠标移动多久合并发送一次（毫秒）。越小越跟手，太小会挤占蓝牙带宽
-motion_interval_ms = 10
+# 鼠标移动多久合并发送一次（毫秒）。越小越跟手、越顺滑，太小会挤占蓝牙带宽
+motion_interval_ms = 4
 
 # 在屏幕边缘连续往外推多少次鼠标事件才切到 iPad（防止误切）
 edge_dwell = 3
