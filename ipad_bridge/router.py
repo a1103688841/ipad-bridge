@@ -5,6 +5,9 @@ pumps its message queue). Other threads talk to it only through post().
 """
 import ctypes
 import logging
+import os
+import tempfile
+import time
 from ctypes import wintypes
 
 from . import hid
@@ -12,15 +15,34 @@ from .win32 import (
     HOOKPROC, KBDLLHOOKSTRUCT, KEYEVENTF_KEYUP, LLKHF_EXTENDED, LLKHF_UP, MSLLHOOKSTRUCT,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    cursor_pos, kernel32, monitor_rects, user32,
+    cursor_pos, get_pointer_ballistics, kernel32, monitor_rects, set_pointer_ballistics, user32,
 )
 
 log = logging.getLogger(__name__)
+
+# Original Windows pointer settings while we have them switched off; survives a crash or kill.
+BALLISTICS_FILE = os.path.join(tempfile.gettempdir(), "ipad-bridge-pointer.txt")
+
+
+def restore_saved_ballistics():
+    """Put back pointer settings left behind by a run that ended while controlling the iPad."""
+    try:
+        with open(BALLISTICS_FILE) as f:
+            values = [int(v) for v in f.read().split()]
+    except (OSError, ValueError):
+        return
+    if len(values) == 4:
+        set_pointer_ballistics(*values)
+        log.info("restored Windows pointer settings %s from a previous run", values)
+    os.remove(BALLISTICS_FILE)
+
 
 MSG_CONNECTION = WM_APP + 1
 MSG_TOGGLE = WM_APP + 2
 
 VK_MENU_MASK = 0xE8  # unassigned key, injected so a swallowed Alt/Win hotkey doesn't open menus
+RETURN_GRACE = 0.3   # seconds after switching to the iPad during which we never switch back
+TRACE_MOVES = 20     # log the first mouse moves of each iPad session (diagnostics)
 
 _BUTTONS = {
     WM_LBUTTONDOWN: (hid.BUTTON_LEFT, True), WM_LBUTTONUP: (hid.BUTTON_LEFT, False),
@@ -51,8 +73,10 @@ class Router:
         self._return_push = 0
         self._frac = [0.0, 0.0]
         self._wheel_acc = 0
+        self._saved_ballistics = None
+        self._session = [0.0, 0]  # start time, mouse moves seen while on the iPad
 
-        self._held = set()            # physically held keys (async key state is stale while swallowing)
+        self._held = set()           # physically held keys (async key state is stale while swallowing)
         self._pc_keys = set()         # pressed while on the PC: their releases go to the PC
         self._ipad_keys_down = set()  # pressed while on the iPad: their releases never reach the PC
         self._hotkey_up = None
@@ -122,6 +146,8 @@ class Router:
         self._entry = pos
         self._park = ((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
         user32.SetCursorPos(*self._park)
+        if self.cfg.disable_windows_accel:
+            self._raw_pointer()
         self._frac = [0.0, 0.0]
         self._wheel_acc = 0
         self._return_push = 0
@@ -132,11 +158,30 @@ class Router:
             self._vx = 0.0
         else:
             self._vx = self.cfg.ipad_width / 2.0
+        self._session = [time.perf_counter(), 0]
         log.info("-> iPad (%s) at %s", "edge" if from_edge else "hotkey", pos)
         self._notify()
 
+    def _raw_pointer(self):
+        """Turn off Windows acceleration so the hook sees 1:1 mouse counts; the iPad adds its own."""
+        self._saved_ballistics = get_pointer_ballistics()
+        with open(BALLISTICS_FILE, "w") as f:
+            f.write(" ".join(str(v) for v in self._saved_ballistics))
+        set_pointer_ballistics(0, 0, 0, 10)
+
+    def _restore_pointer(self):
+        if self._saved_ballistics is None:
+            return
+        set_pointer_ballistics(*self._saved_ballistics)
+        self._saved_ballistics = None
+        try:
+            os.remove(BALLISTICS_FILE)
+        except OSError:
+            pass
+
     def _exit(self, at_edge=False):
         self.ipad_mode = False
+        self._restore_pointer()
         self.ble.release_all()
         self._swallow_button_ups |= self._ipad_buttons
         self._ipad_buttons = 0
@@ -146,7 +191,9 @@ class Router:
         if at_edge:
             x += -2 if self._right else 2
         user32.SetCursorPos(x, y)
-        log.info("-> PC (%s)", "edge" if at_edge else "hotkey/disconnect")
+        span = max(0.001, time.perf_counter() - self._session[0])
+        log.info("-> PC (%s) after %.1fs, %.0f mouse moves/s",
+                 "edge" if at_edge else "hotkey/disconnect", span, self._session[1] / span)
         self._notify()
 
     def _try_enter_at_edge(self, px, py):
@@ -205,9 +252,13 @@ class Router:
             return False
 
         if msg == WM_MOUSEMOVE:
+            self._session[1] += 1
             dx, dy = m.pt.x - self._park[0], m.pt.y - self._park[1]
             if dx or dy:
                 self._ipad_motion(dx, dy)
+            if self._session[1] <= TRACE_MOVES:
+                log.info("trace #%d pt=(%d,%d) d=(%d,%d) vx=%.0f push=%d flags=%#x",
+                         self._session[1], m.pt.x, m.pt.y, dx, dy, self._vx, self._return_push, m.flags)
             return True
         if button:
             bit, down = button
@@ -244,6 +295,8 @@ class Router:
             self._vx += away
             return
         self._vx = 0.0
+        if time.perf_counter() - self._session[0] < RETURN_GRACE:
+            return  # just arrived: a twitch back must not bounce us straight to the PC
         self._return_push += -away
         if self._return_push >= self.cfg.return_push:
             self._exit(at_edge=True)

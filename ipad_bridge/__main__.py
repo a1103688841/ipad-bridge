@@ -7,7 +7,7 @@ import sys
 from . import win32
 from .ble import BleHid
 from .config import Config
-from .router import MSG_CONNECTION, MSG_TOGGLE, Router
+from .router import MSG_CONNECTION, MSG_TOGGLE, Router, restore_saved_ballistics
 from .tray import Tray
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,8 +39,11 @@ def main():
         win32.message_box("配置文件有误：\n%s\n\n%s" % (CONFIG_PATH, e), flags=win32.MB_ICONERROR)
         return 1
 
+    restore_saved_ballistics()
+    log.info("Windows pointer settings (threshold1, threshold2, accel, speed): %s", win32.get_pointer_ballistics())
     router = Router(cfg, ble=None)
     ble = BleHid(on_connection_change=lambda connected: router.post(MSG_CONNECTION, int(connected)))
+    ble.motion_interval = cfg.motion_interval_ms / 1000.0
     router.ble = ble
     try:
         ble.start()

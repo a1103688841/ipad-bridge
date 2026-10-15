@@ -8,6 +8,7 @@ import asyncio
 import collections
 import logging
 import threading
+import time
 import uuid
 
 from winrt.windows.devices.bluetooth import BluetoothAdapter, BluetoothError
@@ -27,6 +28,7 @@ from . import hid
 log = logging.getLogger(__name__)
 
 ENCRYPTED = GattProtectionLevel.ENCRYPTION_REQUIRED
+CONNECTION_POLL = 0.5  # seconds between checks of who is subscribed
 
 
 def uuid16(value):
@@ -41,6 +43,35 @@ def to_buffer(data):
 
 def clamp(value, low=-127, high=127):
     return max(low, min(high, value))
+
+
+class _Stats:
+    """Logs how fast reports actually go out, every few seconds while sending."""
+
+    PERIOD = 5.0
+
+    def __init__(self):
+        self._reset(time.perf_counter())
+
+    def _reset(self, now):
+        self.since = now
+        self.motion = self.other = 0
+        self.total = self.worst = 0.0
+
+    def add(self, is_motion, seconds):
+        if is_motion:
+            self.motion += 1
+        else:
+            self.other += 1
+        self.total += seconds
+        self.worst = max(self.worst, seconds)
+        now = time.perf_counter()
+        span = now - self.since
+        if span >= self.PERIOD:
+            n = self.motion + self.other
+            log.info("sent %.0f motion/s + %d other in %.1fs, notify avg %.1f ms, worst %.1f ms",
+                     self.motion / span, self.other, span, self.total / n * 1000, self.worst * 1000)
+            self._reset(now)
 
 
 class BleHid:
@@ -58,6 +89,10 @@ class BleHid:
         self._button_states = collections.deque()
         self._buttons = 0
         self._dx = self._dy = self._wheel = 0
+
+        self.motion_interval = 0.010
+        self._last_motion = 0.0
+        self._stats = _Stats()
 
         self._hid = self._battery = None
         self._kbd = self._mouse = None
@@ -199,13 +234,19 @@ class BleHid:
 
     # ---- sender -------------------------------------------------------------------------------
 
-    def _next_report(self):
+    def _next_report(self, now):
+        """(characteristic, report, is_motion), seconds to wait before the next motion report, or None."""
         with self._lock:
             if self._kbd_reports:
-                return self._kbd, self._kbd_reports.popleft()
+                return self._kbd, self._kbd_reports.popleft(), False
             if self._button_states:
-                buttons = self._button_states.popleft()
+                buttons = self._button_states.popleft()  # button changes go out right away, in order
             elif self._dx or self._dy or self._wheel:
+                # Pace pure motion: merged deltas at a steady rate move the iPad pointer smoothly,
+                # bursts of tiny reports make its acceleration curve jumpy.
+                wait = self._last_motion + self.motion_interval - now
+                if wait > 0:
+                    return wait
                 buttons = self._buttons
             else:
                 return None
@@ -213,26 +254,38 @@ class BleHid:
             self._dx -= dx
             self._dy -= dy
             self._wheel -= wheel
-        return self._mouse, bytes([buttons, dx & 0xFF, dy & 0xFF, wheel & 0xFF])
+        self._last_motion = now
+        return self._mouse, bytes([buttons, dx & 0xFF, dy & 0xFF, wheel & 0xFF]), True
 
     async def _send_loop(self):
+        timeout = CONNECTION_POLL
+        next_poll = 0.0
         while not self._stopping:
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=0.5)
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
             self._wake.clear()
-            self._check_connection()
+            now = time.perf_counter()
+            if now >= next_poll:
+                self._check_connection()
+                next_poll = now + CONNECTION_POLL
+            timeout = max(0.001, next_poll - now)
             while not self._stopping:
-                item = self._next_report()
+                item = self._next_report(time.perf_counter())
                 if item is None:
                     break
-                char, report = item
+                if isinstance(item, float):
+                    timeout = min(timeout, item)
+                    break
+                char, report, is_motion = item
+                started = time.perf_counter()
                 try:
                     results = await char.notify_value_async(to_buffer(report))
                 except Exception as e:
                     log.warning("notify failed: %s", e)
                     continue
+                self._stats.add(is_motion, time.perf_counter() - started)
                 for r in results:
                     if r.status != 0:  # GattCommunicationStatus.SUCCESS
                         log.warning("notify -> %s (protocol error %s)", r.status, r.protocol_error)

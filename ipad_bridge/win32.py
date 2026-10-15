@@ -100,6 +100,31 @@ kernel32.SetConsoleCtrlHandler.argtypes = [HANDLER_ROUTINE, wintypes.BOOL]
 kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
 
 
+user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+SPI_GETMOUSE = 0x0003
+SPI_SETMOUSE = 0x0004
+SPI_GETMOUSESPEED = 0x0070
+SPI_SETMOUSESPEED = 0x0071
+
+
+def get_pointer_ballistics():
+    """(threshold1, threshold2, acceleration, speed): Windows pointer acceleration and speed slider."""
+    mouse = (ctypes.c_int * 3)()
+    speed = ctypes.c_int()
+    user32.SystemParametersInfoW(SPI_GETMOUSE, 0, mouse, 0)
+    user32.SystemParametersInfoW(SPI_GETMOUSESPEED, 0, ctypes.byref(speed), 0)
+    return mouse[0], mouse[1], mouse[2], speed.value
+
+
+def set_pointer_ballistics(threshold1, threshold2, acceleration, speed):
+    """Apply for this session only (not written to the registry, so a logoff always restores it)."""
+    mouse = (ctypes.c_int * 3)(threshold1, threshold2, acceleration)
+    user32.SystemParametersInfoW(SPI_SETMOUSE, 0, mouse, 0)
+    user32.SystemParametersInfoW(SPI_SETMOUSESPEED, 0, ctypes.c_void_p(speed), 0)
+
+
 def set_dpi_aware():
     """Work in physical pixels so hook coordinates, SetCursorPos and monitor rects agree."""
     try:

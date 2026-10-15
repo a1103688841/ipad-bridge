@@ -16,6 +16,13 @@ speed = 1.0
 # 滚轮每格滚动的行数
 scroll = 1
 
+# 控制 iPad 时临时关掉 Windows 的"提高指针精确度"（鼠标加速），回到电脑自动恢复。
+# iPad 自己还会再加速一次，两层叠加会让指针发飘
+disable_windows_accel = true
+
+# 鼠标移动多久合并发送一次（毫秒）。越小越跟手，太小会挤占蓝牙带宽
+motion_interval_ms = 10
+
 # 在屏幕边缘连续往外推多少次鼠标事件才切到 iPad（防止误切）
 edge_dwell = 3
 
@@ -24,7 +31,7 @@ edge_dwell = 3
 ipad_width = 1600
 
 # 到了 iPad 靠电脑那一侧的边缘后，还要再往回推多少才回到电脑
-return_push = 40
+return_push = 200
 
 # true：Ctrl 当作 iPad 的 Command（Ctrl+C/V 直接复制粘贴），Win 键当作 Control
 # false：Win 键 = Command，Ctrl = Control
@@ -56,6 +63,8 @@ class Config:
         self.hotkey_vk, self.hotkey_mods = parse_hotkey(self.hotkey)
         self.speed = s.getfloat("speed")
         self.scroll = s.getint("scroll")
+        self.disable_windows_accel = s.getboolean("disable_windows_accel")
+        self.motion_interval_ms = max(1, s.getint("motion_interval_ms"))
         self.edge_dwell = max(1, s.getint("edge_dwell"))
         self.ipad_width = max(100, s.getint("ipad_width"))
         self.return_push = max(1, s.getint("return_push"))
